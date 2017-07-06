@@ -110,6 +110,10 @@ const (
 	// VendorMode indicates imports should be resolved to libraries in the
 	// vendor directory.
 	VendorMode
+
+	// UnoMode indicates imports should be resolved to libraries in the vendor
+	// directory. Generates a single BUILD file for the entire vendor directory.
+	UnoMode
 )
 
 // DependencyModeFromString converts a string from the command line
@@ -121,6 +125,8 @@ func DependencyModeFromString(s string) (DependencyMode, error) {
 		return ExternalMode, nil
 	case "vendored":
 		return VendorMode, nil
+	case "uno":
+		return UnoMode, nil
 	default:
 		return 0, fmt.Errorf("unrecognized dependency mode: %q", s)
 	}

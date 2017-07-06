@@ -33,6 +33,7 @@ import (
 	"github.com/bazelbuild/rules_go/go/tools/gazelle/packages"
 	"github.com/bazelbuild/rules_go/go/tools/gazelle/rules"
 	"github.com/bazelbuild/rules_go/go/tools/gazelle/wspace"
+	"path"
 )
 
 type emitFunc func(*config.Config, *bf.File) error
@@ -47,6 +48,48 @@ func run(c *config.Config, emit emitFunc) {
 	g := rules.NewGenerator(c)
 	shouldProcessRoot := false
 	didProcessRoot := false
+
+	// Create the build file for the vendor dir.
+	vendorFiles := make([]*bf.File, 0)
+	for _, dir := range c.Dirs {
+		var buildFilePath string = filepath.Join(dir, "vendor", "BUILD")
+		var buildFile *bf.File = nil
+
+		for _, base := range c.ValidBuildFileNames {
+			buildFilePath = filepath.Join(dir, "vendor", base)
+
+			// Ensure this is a file that exists (not a directory).
+			if st, err := os.Stat(buildFilePath); os.IsNotExist(err) || err == nil && st.IsDir() {
+				continue
+			}
+			fileData, err := ioutil.ReadFile(buildFilePath)
+			if err != nil {
+				log.Print(err)
+				continue
+			}
+			if buildFile != nil {
+				log.Printf(
+					"In directory %s, multiple Bazel files are present.\n",
+					path.Clean(buildFilePath + "../"),
+				)
+				continue
+			}
+			buildFile, err = bf.Parse(buildFilePath, fileData)
+			if err != nil {
+				log.Print(err)
+				continue
+			}
+		}
+
+		if buildFile != nil {
+			buildFile = &bf.File{
+				Path: buildFilePath,
+			}
+		}
+
+		vendorFiles = append(vendorFiles, buildFile)
+	}
+
 	for _, dir := range c.Dirs {
 		if c.RepoRoot == dir {
 			shouldProcessRoot = true
@@ -55,7 +98,32 @@ func run(c *config.Config, emit emitFunc) {
 			if pkg.Rel == "" {
 				didProcessRoot = true
 			}
-			processPackage(c, g, emit, pkg, oldFile)
+
+			// If we're using the uno mode and this is a vendored package, write
+			// the vendor BUILD file as one aggregate file.
+			isVendored := false
+			if c.DepMode == config.UnoMode {
+				for _, d := range c.Dirs {
+					if strings.HasPrefix(pkg.Dir, path.Clean(fmt.Sprintf("%s/vendor/", d))) {
+						isVendored = true
+					}
+				}
+			}
+
+			if isVendored {
+				var vendorFile *bf.File = nil
+				for _, v := range vendorFiles {
+					fmt.Printf("%s, %s\n", pkg.Dir, path.Dir(path.Dir(v.Path)))
+					if strings.HasPrefix(pkg.Dir, path.Dir(path.Dir(v.Path))) {
+						vendorFile = v
+					}
+				}
+				// TODO: Merge these files instead of writing to the same one...
+				// TODO: Also, the files listed are in the wrong location...
+				processPackage(c, g, emit, pkg, vendorFile)
+			} else {
+				processPackage(c, g, emit, pkg, oldFile)
+			}
 		})
 	}
 	if shouldProcessRoot && !didProcessRoot {

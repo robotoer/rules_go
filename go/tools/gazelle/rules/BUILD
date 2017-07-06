@@ -10,6 +10,7 @@ go_library(
         "resolve_external.go",
         "resolve_structured.go",
         "resolve_vendored.go",
+        "resolve_uno.go",
     ],
     visibility = ["//visibility:public"],
     deps = [

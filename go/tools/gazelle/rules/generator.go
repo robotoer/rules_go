@@ -24,6 +24,8 @@ import (
 	bf "github.com/bazelbuild/buildtools/build"
 	"github.com/bazelbuild/rules_go/go/tools/gazelle/config"
 	"github.com/bazelbuild/rules_go/go/tools/gazelle/packages"
+	"path"
+	"sort"
 )
 
 const (
@@ -69,6 +71,18 @@ func NewGenerator(c *config.Config) Generator {
 		e = newExternalResolver()
 	case config.VendorMode:
 		e = vendoredResolver{}
+	case config.UnoMode:
+		dirs := sort.StringSlice{}
+		for _, dir := range c.Dirs {
+			dirs = append(dirs, strings.TrimPrefix(dir, path.Clean(c.RepoRoot) + "/"))
+		}
+		// Sort all subprojects so that we can pick the most specific match when
+		// looking for the subproject that a package belongs to.
+		sort.Sort(dirs)
+		sort.Reverse(dirs)
+		e = unoResolver{
+			projRoots: []string(dirs),
+		}
 	default:
 		return nil
 	}
@@ -90,6 +104,19 @@ type generator struct {
 }
 
 func (g *generator) Generate(pkg *packages.Package) *bf.File {
+	isVendored := false
+	for _, d := range g.c.Dirs {
+		if strings.HasPrefix(pkg.Dir, path.Clean(fmt.Sprintf("%s/vendor/", d))) {
+			isVendored = true
+		}
+	}
+
+	if isVendored {
+		fmt.Printf("Is vendored:    %s\n", pkg.Dir)
+	} else {
+		fmt.Printf("Isn't vendored: %s\n", pkg.Dir)
+	}
+
 	f := &bf.File{
 		Path: filepath.Join(pkg.Dir, g.c.DefaultBuildFileName()),
 	}
