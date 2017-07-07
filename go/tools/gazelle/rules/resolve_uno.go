@@ -47,6 +47,7 @@ func (v unoResolver) resolve(importpath, dir string) (label, error) {
 
 	return label{
 		pkg:  fmt.Sprintf("%s/vendor", projRoot),
+		//name: importpath + "_" + defaultLibName,
 		name: importpath,
 	}, nil
 }

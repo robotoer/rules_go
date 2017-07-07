@@ -56,6 +56,10 @@ type Generator interface {
 	// top-level package in the repository, the file will contain a
 	// "go_prefix" rule.
 	Generate(pkg *packages.Package) *bf.File
+
+	// GenerateVendor generates a single BUILD file for all vendored packages
+	// under ${bfPath}/vendor/.
+	GenerateVendor(bfPath string, vendored []*packages.Package) *bf.File
 }
 
 func NewGenerator(c *config.Config) Generator {
@@ -104,23 +108,10 @@ type generator struct {
 }
 
 func (g *generator) Generate(pkg *packages.Package) *bf.File {
-	isVendored := false
-	for _, d := range g.c.Dirs {
-		if strings.HasPrefix(pkg.Dir, path.Clean(fmt.Sprintf("%s/vendor/", d))) {
-			isVendored = true
-		}
-	}
-
-	if isVendored {
-		fmt.Printf("Is vendored:    %s\n", pkg.Dir)
-	} else {
-		fmt.Printf("Isn't vendored: %s\n", pkg.Dir)
-	}
-
 	f := &bf.File{
 		Path: filepath.Join(pkg.Dir, g.c.DefaultBuildFileName()),
 	}
-	rs := g.generateRules(pkg)
+	rs := g.generateRules(pkg.Dir, pkg)
 	if load := g.generateLoad(rs); load != nil {
 		f.Stmt = append(f.Stmt, load)
 	}
@@ -130,51 +121,90 @@ func (g *generator) Generate(pkg *packages.Package) *bf.File {
 	return f
 }
 
-func (g *generator) generateRules(pkg *packages.Package) []*bf.Rule {
+func (g *generator) GenerateVendor(bfPath string, vendored []*packages.Package) *bf.File {
+	f := &bf.File{
+		Path: filepath.Join(bfPath, g.c.DefaultBuildFileName()),
+	}
+
+	// Generate the rules that apply to each package.
+	rules := make([]*bf.Rule, 0)
+	for _, vendoredPkg := range vendored {
+		rules = append(rules, g.generateVendorRules(bfPath, vendoredPkg)...)
+	}
+
+	if load := g.generateLoad(rules); load != nil {
+		f.Stmt = append(f.Stmt, load)
+	}
+	for _, r := range rules {
+		f.Stmt = append(f.Stmt, r.Call)
+	}
+	return f
+}
+
+func (g *generator) generateRules(bfPath string, pkg *packages.Package) []*bf.Rule {
 	var rules []*bf.Rule
 	if pkg.Rel == "" {
 		rules = append(rules, newRule("go_prefix", []interface{}{g.c.GoPrefix}, nil))
 	}
 
-	cgoLibrary, r := g.generateCgoLib(pkg)
+	cgoLibrary, r := g.generateCgoLib(bfPath, pkg)
 	if r != nil {
 		rules = append(rules, r)
 	}
 
-	library, r := g.generateLib(pkg, cgoLibrary)
+	library, r := g.generateLib(bfPath, pkg, cgoLibrary)
 	if r != nil {
 		rules = append(rules, r)
 	}
 
-	if r := g.generateBin(pkg, library); r != nil {
+	if r := g.generateBin(bfPath, pkg, library); r != nil {
 		rules = append(rules, r)
 	}
 
-	if r := g.filegroup(pkg); r != nil {
+	if r := g.filegroup(bfPath, pkg); r != nil {
 		rules = append(rules, r)
 	}
 
-	if r := g.generateTest(pkg, library); r != nil {
+	if r := g.generateTest(bfPath, pkg, library); r != nil {
 		rules = append(rules, r)
 	}
 
-	if r := g.generateXTest(pkg, library); r != nil {
+	if r := g.generateXTest(bfPath, pkg, library); r != nil {
 		rules = append(rules, r)
 	}
 
 	return rules
 }
 
-func (g *generator) generateBin(pkg *packages.Package, library string) *bf.Rule {
+func (g *generator) generateVendorRules(bfPath string, pkg *packages.Package) []*bf.Rule {
+	var rules []*bf.Rule
+	cgoLibrary, r := g.generateCgoLib(bfPath, pkg)
+	if r != nil {
+		rules = append(rules, r)
+	}
+
+	_, r = g.generateLib(bfPath, pkg, cgoLibrary)
+	if r != nil {
+		rules = append(rules, r)
+	}
+
+	if r := g.filegroup(bfPath, pkg); r != nil {
+		rules = append(rules, r)
+	}
+
+	return rules
+}
+
+func (g *generator) generateBin(bfPath string, pkg *packages.Package, library string) *bf.Rule {
 	if !pkg.IsCommand() || pkg.Binary.Sources.IsEmpty() && library == "" {
 		return nil
 	}
 	name := filepath.Base(pkg.Dir)
 	visibility := checkInternalVisibility(pkg.Rel, "//visibility:public")
-	return g.generateRule(pkg.Rel, "go_binary", name, visibility, library, false, pkg.Binary)
+	return g.generateRule(bfPath, pkg.Rel, "go_binary", name, visibility, library, false, pkg.Binary)
 }
 
-func (g *generator) generateLib(pkg *packages.Package, cgoName string) (string, *bf.Rule) {
+func (g *generator) generateLib(bfPath string, pkg *packages.Package, cgoName string) (string, *bf.Rule) {
 	if !pkg.Library.HasGo() && cgoName == "" {
 		return "", nil
 	}
@@ -188,19 +218,19 @@ func (g *generator) generateLib(pkg *packages.Package, cgoName string) (string, 
 		visibility = checkInternalVisibility(pkg.Rel, "//visibility:public")
 	}
 
-	rule := g.generateRule(pkg.Rel, "go_library", name, visibility, cgoName, false, pkg.Library)
-	return name, rule
+	rule := g.generateRule(bfPath, pkg.Rel, "go_library", name, visibility, cgoName, false, pkg.Library)
+	return rule.Name(), rule
 }
 
-func (g *generator) generateCgoLib(pkg *packages.Package) (string, *bf.Rule) {
+func (g *generator) generateCgoLib(bfPath string, pkg *packages.Package) (string, *bf.Rule) {
 	if !pkg.CgoLibrary.HasGo() {
 		return "", nil
 	}
 
 	name := defaultCgoLibName
 	visibility := "//visibility:private"
-	rule := g.generateRule(pkg.Rel, "cgo_library", name, visibility, "", false, pkg.CgoLibrary)
-	return name, rule
+	rule := g.generateRule(bfPath, pkg.Rel, "cgo_library", name, visibility, "", false, pkg.CgoLibrary)
+	return rule.Name(), rule
 }
 
 // checkInternalVisibility overrides the given visibility if the package is
@@ -217,18 +247,32 @@ func checkInternalVisibility(rel, visibility string) string {
 // filegroup is a small hack for directories with pre-generated .pb.go files
 // and also source .proto files.  This creates a filegroup for the .proto in
 // addition to the usual go_library for the .pb.go files.
-func (g *generator) filegroup(pkg *packages.Package) *bf.Rule {
+func (g *generator) filegroup(bfPath string, pkg *packages.Package) *bf.Rule {
+	bfRel := relPath(bfPath, pkg.Dir)
+
 	if !pkg.HasPbGo || len(pkg.Protos) == 0 {
 		return nil
 	}
+
+	name := defaultProtosName
+	protos := pkg.Protos
+	if bfRel != "" {
+		protos = make([]string, 0, len(pkg.Protos))
+		for _, proto := range protos {
+			protos = append(protos, bfRel + "/" + proto)
+		}
+
+		name = bfRel + "_" + defaultProtosName
+	}
+
 	return newRule("filegroup", nil, []keyvalue{
-		{key: "name", value: defaultProtosName},
-		{key: "srcs", value: pkg.Protos},
+		{key: "name", value: name},
+		{key: "srcs", value: protos},
 		{key: "visibility", value: []string{"//visibility:public"}},
 	})
 }
 
-func (g *generator) generateTest(pkg *packages.Package, library string) *bf.Rule {
+func (g *generator) generateTest(bfPath string, pkg *packages.Package, library string) *bf.Rule {
 	if !pkg.Test.HasGo() {
 		return nil
 	}
@@ -240,10 +284,10 @@ func (g *generator) generateTest(pkg *packages.Package, library string) *bf.Rule
 		name = library + "_test"
 	}
 
-	return g.generateRule(pkg.Rel, "go_test", name, "", library, pkg.HasTestdata, pkg.Test)
+	return g.generateRule(bfPath, pkg.Rel, "go_test", name, "", library, pkg.HasTestdata, pkg.Test)
 }
 
-func (g *generator) generateXTest(pkg *packages.Package, library string) *bf.Rule {
+func (g *generator) generateXTest(bfPath string, pkg *packages.Package, library string) *bf.Rule {
 	if !pkg.XTest.HasGo() {
 		return nil
 	}
@@ -255,17 +299,32 @@ func (g *generator) generateXTest(pkg *packages.Package, library string) *bf.Rul
 		name = library + "_xtest"
 	}
 
-	return g.generateRule(pkg.Rel, "go_test", name, "", "", pkg.HasTestdata, pkg.XTest)
+	return g.generateRule(bfPath, pkg.Rel, "go_test", name, "", "", pkg.HasTestdata, pkg.XTest)
 }
 
-func (g *generator) generateRule(rel, kind, name, visibility, library string, hasTestdata bool, target packages.Target) *bf.Rule {
+func (g *generator) generateRule(bfPath, rel, kind, name, visibility, library string, hasTestdata bool, target packages.Target) *bf.Rule {
+	bfRel := relPath(bfPath, path.Join(g.c.RepoRoot, rel))
+	prependBfRel := func(s string) (string, error) {
+		return bfRel + "/" + s, nil
+	}
+
+	if bfRel != "" {
+		//name = bfRel + "_" + name
+		name = bfRel
+	}
+
 	// Construct attrs in the same order that bf.Rewrite uses. See
 	// namePriority in github.com/bazelbuild/buildtools/build/rewrite.go.
 	attrs := []keyvalue{
 		{"name", name},
 	}
 	if !target.Sources.IsEmpty() {
-		attrs = append(attrs, keyvalue{"srcs", target.Sources})
+		// Ignore errs here since its not possible for prependBfRel to return an error.
+		srcs := target.Sources
+		if bfRel != "" {
+			srcs, _ = target.Sources.Map(prependBfRel)
+		}
+		attrs = append(attrs, keyvalue{"srcs", srcs})
 	}
 	if !target.CLinkOpts.IsEmpty() {
 		attrs = append(attrs, keyvalue{"clinkopts", target.CLinkOpts})
@@ -274,7 +333,12 @@ func (g *generator) generateRule(rel, kind, name, visibility, library string, ha
 		attrs = append(attrs, keyvalue{"copts", target.COpts})
 	}
 	if hasTestdata {
-		glob := globvalue{patterns: []string{"testdata/**"}}
+		var glob globvalue
+		if bfRel != "" {
+			glob = globvalue{patterns: []string{bfRel + "/testdata/**"}}
+		} else {
+			glob = globvalue{patterns: []string{"testdata/**"}}
+		}
 		attrs = append(attrs, keyvalue{"data", glob})
 	}
 	if library != "" {
@@ -341,4 +405,17 @@ func (g *generator) dependencies(imports packages.PlatformStrings, dir string) p
 // isRelative determines if an importpath is relative.
 func isRelative(importpath string) bool {
 	return strings.HasPrefix(importpath, "./") || strings.HasPrefix(importpath, "..")
+}
+
+// relPath returns the relative path between the provided paths or returns "" if
+// the two paths aren't relative.
+func relPath(base string, p string) string {
+	cleanP := path.Clean(p)
+	cleanBase := path.Clean(base)
+
+	if cleanP != cleanBase && strings.HasPrefix(cleanP, cleanBase) {
+		return strings.TrimPrefix(cleanP, cleanBase)[1:]
+	} else {
+		return ""
+	}
 }

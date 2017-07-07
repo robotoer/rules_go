@@ -44,51 +44,42 @@ var modeFromName = map[string]emitFunc{
 	"diff":  diffFile,
 }
 
+func findExistingBuildFile(dir string, bfNames []string) (*bf.File, error) {
+	var buildFile *bf.File = nil
+
+	for _, base := range bfNames {
+		p := filepath.Join(dir, "vendor", base)
+
+		// Ensure this is a file that exists (not a directory).
+		if st, err := os.Stat(p); os.IsNotExist(err) || err == nil && st.IsDir() {
+			continue
+		}
+
+		fileData, err := ioutil.ReadFile(p)
+		if err != nil {
+			return nil, err
+		}
+		if buildFile != nil {
+			return nil, fmt.Errorf(
+				"In directory %s, multiple Bazel files are present.\n",
+				path.Clean(p + "../"),
+			)
+		}
+		buildFile, err = bf.Parse(p, fileData)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return buildFile, nil
+}
+
 func run(c *config.Config, emit emitFunc) {
 	g := rules.NewGenerator(c)
 	shouldProcessRoot := false
 	didProcessRoot := false
 
-	// Create the build file for the vendor dir.
-	vendorFiles := make([]*bf.File, 0)
-	for _, dir := range c.Dirs {
-		var buildFilePath string = filepath.Join(dir, "vendor", "BUILD")
-		var buildFile *bf.File = nil
-
-		for _, base := range c.ValidBuildFileNames {
-			buildFilePath = filepath.Join(dir, "vendor", base)
-
-			// Ensure this is a file that exists (not a directory).
-			if st, err := os.Stat(buildFilePath); os.IsNotExist(err) || err == nil && st.IsDir() {
-				continue
-			}
-			fileData, err := ioutil.ReadFile(buildFilePath)
-			if err != nil {
-				log.Print(err)
-				continue
-			}
-			if buildFile != nil {
-				log.Printf(
-					"In directory %s, multiple Bazel files are present.\n",
-					path.Clean(buildFilePath + "../"),
-				)
-				continue
-			}
-			buildFile, err = bf.Parse(buildFilePath, fileData)
-			if err != nil {
-				log.Print(err)
-				continue
-			}
-		}
-
-		if buildFile != nil {
-			buildFile = &bf.File{
-				Path: buildFilePath,
-			}
-		}
-
-		vendorFiles = append(vendorFiles, buildFile)
-	}
+	vendorPkgs := make(map[string][]*packages.Package)
 
 	for _, dir := range c.Dirs {
 		if c.RepoRoot == dir {
@@ -101,31 +92,28 @@ func run(c *config.Config, emit emitFunc) {
 
 			// If we're using the uno mode and this is a vendored package, write
 			// the vendor BUILD file as one aggregate file.
-			isVendored := false
-			if c.DepMode == config.UnoMode {
-				for _, d := range c.Dirs {
-					if strings.HasPrefix(pkg.Dir, path.Clean(fmt.Sprintf("%s/vendor/", d))) {
-						isVendored = true
-					}
+			if c.DepMode == config.UnoMode && strings.HasPrefix(pkg.Dir, path.Join(dir, "vendor") + "/") {
+				// Store this for processing later.
+				if _, ok := vendorPkgs[dir]; !ok {
+					vendorPkgs[dir] = make([]*packages.Package, 0)
 				}
-			}
-
-			if isVendored {
-				var vendorFile *bf.File = nil
-				for _, v := range vendorFiles {
-					fmt.Printf("%s, %s\n", pkg.Dir, path.Dir(path.Dir(v.Path)))
-					if strings.HasPrefix(pkg.Dir, path.Dir(path.Dir(v.Path))) {
-						vendorFile = v
-					}
-				}
-				// TODO: Merge these files instead of writing to the same one...
-				// TODO: Also, the files listed are in the wrong location...
-				processPackage(c, g, emit, pkg, vendorFile)
+				vendorPkgs[dir] = append(vendorPkgs[dir], pkg)
 			} else {
-				processPackage(c, g, emit, pkg, oldFile)
+				processNewBuildFile(c, emit, g.Generate(pkg), oldFile)
 			}
 		})
 	}
+
+	// We've processed all of the vendored packages now, so write the vendor build file(s).
+	for d, pkgs := range vendorPkgs {
+		bf, err := findExistingBuildFile(d, c.ValidBuildFileNames)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+		processNewBuildFile(c, emit, g.GenerateVendor(path.Join(d, "vendor"), pkgs), bf)
+	}
+
 	if shouldProcessRoot && !didProcessRoot {
 		// We did not process a package at the repository root. We need to put
 		// a go_prefix rule there, even if there are no .go files in that directory.
@@ -152,13 +140,11 @@ func run(c *config.Config, emit emitFunc) {
 		}
 
 	processRoot:
-		processPackage(c, g, emit, pkg, oldFile)
+		processNewBuildFile(c, emit, g.Generate(pkg), oldFile)
 	}
 }
 
-func processPackage(c *config.Config, g rules.Generator, emit emitFunc, pkg *packages.Package, oldFile *bf.File) {
-	genFile := g.Generate(pkg)
-
+func processNewBuildFile(c *config.Config, emit emitFunc, genFile, oldFile *bf.File) {
 	if oldFile == nil {
 		// No existing file, so no merge required.
 		bf.Rewrite(genFile, nil) // have buildifier 'format' our rules.
